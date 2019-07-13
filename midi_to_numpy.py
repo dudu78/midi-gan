@@ -1,16 +1,19 @@
-
+from itertools import chain
 
 import mido
 import numpy as np
-from itertools import chain
 
 SAMPLES_PER_MEASURE = 96
+MEASURES_IN_OUTPUT = 16
+TOTAL_OUTPUT_TIME_LENGTH = SAMPLES_PER_MEASURE * MEASURES_IN_OUTPUT
 
 
 def detect_time_signature(mid):
-    """returns the ticks per measure of the track,
-    raising an exception if multiple
+    """
+    returns the ticks per measure of the track, raising an exception if multiple.
     (note: 1 measure = 4 beats = 4 quarter notes)
+    :param mid: mide.MidiFile object as input
+    :return: the ticks per measure of the track
     """
     has_time_sig = False
     ticks_per_beat = mid.ticks_per_beat
@@ -29,7 +32,13 @@ def detect_time_signature(mid):
     return ticks_per_measure
 
 
-def numpy_from_midi(midi, ticks_per_measure):
+def numpy_from_midi(midi):
+    """
+    processes a midi to ChannelArrays
+    :param midi: mido.MidiFile object as input
+    :return: iterator over ChannelArrays, extracted from the midi
+    """
+    ticks_per_measure = detect_time_signature(midi)
     note_start_times = {}
     note_start_velocities = {}
     channels = {}
@@ -38,29 +47,37 @@ def numpy_from_midi(midi, ticks_per_measure):
     samples_per_tick = SAMPLES_PER_MEASURE / ticks_per_measure
 
     def curr_array_time():
+        """
+        :return: time in the array that corresponds to current time in the midi
+        """
         # return int(absolute_time * ticks_per_sample)
         return int(absolute_time * samples_per_tick)
         # return absolute_time // (midi.ticks_per_beat // 8)
 
     def finish_note(note, stop_velocity, channel_num):
+        """
+        :param note: note number to finish
+        :param stop_velocity: stopping velocity for the note (starting velocity is saved in note_start_velocities array)
+        :param channel_num: channel number of the note to finish
+        """
         start_velocity = note_start_velocities[channel_num][note]
         start_time = note_start_times[channel_num][note]
         stop_time = curr_array_time()
         assert start_velocity <= 1 and stop_velocity <= 1
         if stop_time - start_time == 0:
             stop_time += 1
-        lnspace = np.linspace(
+        on_strip = np.linspace(
             start_velocity,
             stop_velocity,
             num=stop_time - start_time
         )
-        channels[channel_num].array[note][start_time:stop_time] = lnspace
-        note_start_times[channel_num][note] = -1
+        channels[channel_num].array[note][start_time:stop_time] = on_strip
+        note_start_times[channel_num][note] = -1  # mark note as finished
 
     for track in midi.tracks:
         print('track:', track)
         for msg in track:
-            print('',msg)
+            # print('', msg)
             if msg.type == 'control_change':
                 if msg.control == 0:  # bank change, start of a new track
                     absolute_time = 0
@@ -74,24 +91,24 @@ def numpy_from_midi(midi, ticks_per_measure):
                 note_start_times[msg.channel] = np.full((128,), -1)
                 note_start_velocities[msg.channel] = np.full((128,), 0.0)
             elif msg.type == 'note_on':
-                if curr_array_time() >= 16 * SAMPLES_PER_MEASURE:
-                    print('  skip')
+                if curr_array_time() >= TOTAL_OUTPUT_TIME_LENGTH:
                     continue
                 if msg.velocity == 0:  # same as note_off
                     # ignore
+                    print('ignoring velocity 0')
                     continue
 
                 if note_start_times[msg.channel][msg.note] != -1:  # note already started
-                    # print('unfinished note %d starts again, finishing'
-                    #      % msg.note)
+                    print('unfinished note %d starts again, finishing'
+                          % msg.note)
                     finish_note(msg.note, msg.velocity / (127 * 2), msg.channel)
 
                 note_start_velocities[msg.channel][msg.note] = msg.velocity / 127
                 note_start_times[msg.channel][msg.note] = curr_array_time()
 
             elif msg.type == 'note_off':
-                if curr_array_time() >= 16 * SAMPLES_PER_MEASURE:
-                    print('  skip')
+                if curr_array_time() >= TOTAL_OUTPUT_TIME_LENGTH:
+                    # print('  skip')
                     continue
                 if note_start_times[msg.channel][msg.note] == -1:
                     print('note %d to finish is already finished, ignoring'
@@ -102,22 +119,32 @@ def numpy_from_midi(midi, ticks_per_measure):
 
 
 def shift_left_array(array):
-    """>>> shift_left_array([5,4,9,2])
-    [0,5,4,9 ]"""
+    """
+    >>> shift_left_array([5,4,9,2])
+    [0, 5, 4, 9 ]
+    """
     res = np.roll(array, -1)
     res[-1] = 0
     return res
 
 
 def shift_right_array(array):
-    """>>> shift_right_array([5,4,9,2])
-    [0,5,4,9 ]"""
+    """
+    >>> shift_right_array([5,4,9,2])
+    [0, 5, 4, 9]
+    """
     res = np.roll(array, 1)
     res[0] = 0
     return res
 
 
 def numpy_to_midi_track(chan_array, ticks_per_measure):
+    """
+    turns a channel to a midi track, complete with track start and track end messages
+    :param chan_array: a ChannelArray input object
+    :param ticks_per_measure: desired ticks per measure in the output, used to calculate ticks per sample
+    :return: mido.MidiTrack full of messages
+    """
     ticks_per_sample = ticks_per_measure / SAMPLES_PER_MEASURE
     chan_num = chan_array.channel_num
     array = chan_array.array
@@ -132,8 +159,7 @@ def numpy_to_midi_track(chan_array, ticks_per_measure):
     # now everything is represented time-wise instead of note-wise
     # array[time][note] == velocity
     did_note_start = np.full((128,), False)
-    delta_time = 0
-    float_delta_time = 0.0
+    delta_time = 0.0
     track = mido.MidiTrack()
     # add new track messages
     track.extend([
@@ -154,39 +180,61 @@ def numpy_to_midi_track(chan_array, ticks_per_measure):
                     # end current one
                     track.append(mido.Message('note_off', note=note_num,
                                               velocity=int(127 * vel),
-                                              time=delta_time, channel=chan_num))
-                    float_delta_time = 0
+                                              time=int(delta_time), channel=chan_num))
+                    delta_time = 0.0
                 track.append(mido.Message('note_on', note=note_num,
                                           velocity=int(127 * vel),
-                                          time=delta_time, channel=chan_num))
+                                          time=int(delta_time), channel=chan_num))
                 did_note_start[note_num] = True
-                float_delta_time = 0
+                delta_time = 0.0
             if is_stopping:
                 if did_note_start[note_num]:  # ending a started note
                     track.append(mido.Message('note_off', note=note_num,
                                               velocity=int(127 * vel),
-                                              time=delta_time, channel=chan_num))
-                    float_delta_time = 0
+                                              time=int(delta_time), channel=chan_num))
+                    delta_time = 0.0
                     did_note_start[note_num] = False
                 else:
                     print("cannot end an unstarted note")
 
-        float_delta_time += ticks_per_sample  # next sample
-        delta_time = int(float_delta_time)
+        delta_time += ticks_per_sample  # next sample
 
     track.append(mido.MetaMessage('end_of_track'))
     return track
 
 
 class ChannelArray:
+    """
+    represents a midi track as a numpy array, with some extra info that does not fit in the track e.g. program number.
+    """
+
     def __init__(self, channel_num, program=None, name='', array=None):
         self.program = program
         self.name = name
         self.channel_num = channel_num
-        self.array = array or np.zeros((128, 16 * SAMPLES_PER_MEASURE))
+        self.array = array or np.zeros((128, TOTAL_OUTPUT_TIME_LENGTH))
+        # self.array[note][time] is velocity
+
+    def _arr_info(self):
+        playing = (self.array > 0).T
+        # a[time][note] == (is note playing at that time)
+        start_ind = np.argmax(playing) // playing.shape[1]
+        stop_ind = (len(playing.flatten()) - np.argmax(playing[::-1])) // playing.shape[1]
+        return ('starting %4d stopping %4d'
+                % (start_ind, stop_ind))
+
+    def __repr__(self):
+        return 'channelArray %s#%d with prog %3d. %s' \
+               % (self.name + ' ' if self.name else '',
+                  self.channel_num, self.program, self._arr_info())
 
 
 def map_to_4_channels(channels):
+    """
+    maps multiple channels to only 4 channels, intended for reduction the number of channels for an AI to process
+    :param channels: an iterable of ChannelArrays
+    :return: an list of 4 ChannelArrays
+    """
     # create the four channels:
     drums = ChannelArray(1, name='drums', program=118)  # TODO find a good drums program number
     piano = ChannelArray(2, name='piano', program=4)
@@ -223,15 +271,30 @@ tests = [
     'tests/zelda1.mid',
 ]
 
-fname = tests[0]
-src_midi = mido.MidiFile(fname)
-ticks_per_measure = detect_time_signature(src_midi)
-print(src_midi)
-print(src_midi.ticks_per_beat)
-channels = numpy_from_midi(src_midi, ticks_per_measure)
-# channels = map_to_4_channels(channels.values())
-midi = mido.MidiFile(ticks_per_beat=src_midi.ticks_per_beat)
-for chan_array in channels:
-    back_track = numpy_to_midi_track(chan_array, ticks_per_measure)
-    midi.tracks.append(back_track)
-midi.save('result.mid')
+
+def there_and_back_again(filename):
+    """
+    converts a midi to numpy arrays and back, used for testing the conversion
+    :param filename: an input file name of a midi file
+    """
+    src_midi = mido.MidiFile(filename)
+    ticks_per_measure = detect_time_signature(src_midi)
+    print(src_midi)
+    print(src_midi.ticks_per_beat)
+    channels = numpy_from_midi(src_midi)
+    # channels = map_to_4_channels(channels.values())
+    midi = mido.MidiFile(ticks_per_beat=src_midi.ticks_per_beat)
+
+    infos = []
+    for chan_array in channels:
+        infos.append(str(chan_array))
+        back_track = numpy_to_midi_track(chan_array, ticks_per_measure)
+        midi.tracks.append(back_track)
+    infos.sort()
+    print('\n'.join(infos))
+    midi.save('result.mid')
+
+
+input_filename = tests[1]
+
+there_and_back_again(input_filename)
