@@ -3,7 +3,7 @@ from itertools import chain
 import mido
 import numpy as np
 
-SAMPLES_PER_MEASURE = 96
+SAMPLES_PER_MEASURE = 2 * 96
 MEASURES_IN_OUTPUT = 16
 TOTAL_OUTPUT_TIME_LENGTH = SAMPLES_PER_MEASURE * MEASURES_IN_OUTPUT
 
@@ -50,7 +50,6 @@ def numpy_from_midi(midi):
         """
         :return: time in the array that corresponds to current time in the midi
         """
-        # return int(absolute_time * ticks_per_sample)
         return int(absolute_time * samples_per_tick)
         # return absolute_time // (midi.ticks_per_beat // 8)
 
@@ -82,6 +81,7 @@ def numpy_from_midi(midi):
                 if msg.control == 0:  # bank change, start of a new track
                     absolute_time = 0
                     continue
+
             absolute_time += msg.time
             if msg.type == 'program_change':
                 print(msg)
@@ -91,6 +91,7 @@ def numpy_from_midi(midi):
                 note_start_times[msg.channel] = np.full((128,), -1)
                 note_start_velocities[msg.channel] = np.full((128,), 0.0)
             elif msg.type == 'note_on':
+                if msg.channel != 1: continue  # FIXME
                 if curr_array_time() >= TOTAL_OUTPUT_TIME_LENGTH:
                     continue
                 if msg.velocity == 0:  # same as note_off
@@ -99,20 +100,20 @@ def numpy_from_midi(midi):
                     continue
 
                 if note_start_times[msg.channel][msg.note] != -1:  # note already started
-                    print('unfinished note %d starts again, finishing'
-                          % msg.note)
+                    print('unfinished note %d at time %d starts again, finishing'
+                          % (msg.note, curr_array_time()))
                     finish_note(msg.note, msg.velocity / (127 * 2), msg.channel)
 
                 note_start_velocities[msg.channel][msg.note] = msg.velocity / 127
                 note_start_times[msg.channel][msg.note] = curr_array_time()
 
             elif msg.type == 'note_off':
+                if msg.channel != 1: continue  # FIXME
                 if curr_array_time() >= TOTAL_OUTPUT_TIME_LENGTH:
-                    # print('  skip')
                     continue
                 if note_start_times[msg.channel][msg.note] == -1:
-                    print('note %d to finish is already finished, ignoring'
-                          % msg.note)
+                    print('note %d at time %d to finish is already finished, finishing'
+                          % (msg.note, curr_array_time()))
                     continue
                 finish_note(msg.note, msg.velocity / 127, msg.channel)
     return chain(finished_channels, channels.values())
@@ -151,9 +152,10 @@ def numpy_to_midi_track(chan_array, ticks_per_measure):
     shift_right = shift_right_array(array)
     deriv = array - shift_right
     note_starts = deriv > 0
+    note_starts = (shift_right == 0) & (array != 0)
     note_stops = (shift_left_array(array) == 0) & (array != 0)
     array = array.T
-    shift_right = shift_right.T
+
     note_starts = note_starts.T
     note_stops = note_stops.T
     # now everything is represented time-wise instead of note-wise
@@ -181,18 +183,18 @@ def numpy_to_midi_track(chan_array, ticks_per_measure):
                     track.append(mido.Message('note_off', note=note_num,
                                               velocity=int(127 * vel),
                                               time=int(delta_time), channel=chan_num))
-                    delta_time = 0.0
+                    delta_time -= int(delta_time)
                 track.append(mido.Message('note_on', note=note_num,
                                           velocity=int(127 * vel),
                                           time=int(delta_time), channel=chan_num))
                 did_note_start[note_num] = True
-                delta_time = 0.0
+                delta_time -= int(delta_time)
             if is_stopping:
                 if did_note_start[note_num]:  # ending a started note
                     track.append(mido.Message('note_off', note=note_num,
                                               velocity=int(127 * vel),
                                               time=int(delta_time), channel=chan_num))
-                    delta_time = 0.0
+                    delta_time -= int(delta_time)
                     did_note_start[note_num] = False
                 else:
                     print("cannot end an unstarted note")
@@ -266,10 +268,29 @@ def map_to_4_channels(channels):
 
 
 tests = [
+    'tests/commend.mid',
+    'tests/dgate007.mid',
     'tests/doom1e1.mid',
+    'tests/doom1e1_src_messages.txt',
+    'tests/ff3veldt.mid',
     'tests/g3-intro.mid',
+    'tests/ky1_24.mid',
+    'tests/ky2-78.mid',
+    'tests/ky2-83.mid',
+    'tests/sick.mid',
+    'tests/strike36.mid',
+    'tests/strike41.mid',
     'tests/zelda1.mid',
 ]
+
+
+def write_msgs_to_file(filename, midi):
+    """writes messages of a midi to a file in readable form, for debugging"""
+    f = open(filename, 'w')
+    for track in midi.tracks:
+        f.write(str(track) + '\n')
+        for msg in track:
+            f.write(' ' + str(msg) + '\n')
 
 
 def there_and_back_again(filename):
@@ -277,6 +298,7 @@ def there_and_back_again(filename):
     converts a midi to numpy arrays and back, used for testing the conversion
     :param filename: an input file name of a midi file
     """
+    print('testing on', filename)
     src_midi = mido.MidiFile(filename)
     ticks_per_measure = detect_time_signature(src_midi)
     print(src_midi)
@@ -293,8 +315,10 @@ def there_and_back_again(filename):
     infos.sort()
     print('\n'.join(infos))
     midi.save('result.mid')
+    write_msgs_to_file(filename.split('.')[0] + '_result_messages.txt', midi)
+    write_msgs_to_file(filename.split('.')[0] + '_src_messages.txt', src_midi)
 
 
-input_filename = tests[1]
-
+input_filename = tests[0]
+print('testing on file', input_filename)
 there_and_back_again(input_filename)
