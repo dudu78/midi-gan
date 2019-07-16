@@ -3,8 +3,8 @@ from itertools import chain
 import mido
 import numpy as np
 
-SAMPLES_PER_MEASURE = 2 * 96
-MEASURES_IN_OUTPUT = 16
+SAMPLES_PER_MEASURE = 48
+MEASURES_IN_OUTPUT = 32
 TOTAL_OUTPUT_TIME_LENGTH = SAMPLES_PER_MEASURE * MEASURES_IN_OUTPUT
 
 
@@ -73,30 +73,50 @@ def numpy_from_midi(midi):
         channels[channel_num].array[note][start_time:stop_time] = on_strip
         note_start_times[channel_num][note] = -1  # mark note as finished
 
+    def create_channel(channel_num, program):
+        channels[channel_num] = ChannelArray(msg.channel, program=program)
+        note_start_times[channel_num] = np.full((128,), -1)
+        note_start_velocities[channel_num] = np.full((128,), 0.0)
+
     for track in midi.tracks:
-        print('track:', track)
+        # print('track:', track)
+        pass
         for msg in track:
-            # print('', msg)
             if msg.type == 'control_change':
+                if msg.channel not in channels:  # create new channel
+                    channels[msg.channel] = ChannelArray(msg.channel, program=None)
+                    note_start_times[msg.channel] = np.full((128,), -1)
+                    note_start_velocities[msg.channel] = np.full((128,), 0.0)
                 if msg.control == 0:  # bank change, start of a new track
                     absolute_time = 0
                     continue
-
+            elif msg.type == 'end_of_track':
+                absolute_time = 0
+                continue
+            elif msg.type == 'marker':
+                continue
             absolute_time += msg.time
+
             if msg.type == 'program_change':
-                print(msg)
+                # print(msg)
                 if msg.channel in channels:  # program change for existing channel
-                    finished_channels.append(channels[msg.channel])  # archive channel
-                channels[msg.channel] = ChannelArray(msg.channel, program=msg.program)
-                note_start_times[msg.channel] = np.full((128,), -1)
-                note_start_velocities[msg.channel] = np.full((128,), 0.0)
+                    if channels[msg.channel].program is None:  # first time setting program, no need to create new channel
+                        channels[msg.channel].program = msg.program
+                    else:
+                        # introduce this as a new channel
+                        finished_channels.append(channels[msg.channel])  # archive channel
+                        create_channel(msg.channel, msg.program)
+                else:
+                    # create new channel
+                    create_channel(msg.channel, msg.program)
             elif msg.type == 'note_on':
-                if msg.channel != 1: continue  # FIXME
                 if curr_array_time() >= TOTAL_OUTPUT_TIME_LENGTH:
                     continue
+                if msg.channel not in channels:
+                    create_channel(msg.channel, None)
                 if msg.velocity == 0:  # same as note_off
-                    # ignore
-                    print('ignoring velocity 0')
+                    if note_start_times[msg.channel][msg.note] != -1:  # note started, lets finish
+                        finish_note(msg.note, msg.velocity / 127, msg.channel)
                     continue
 
                 if note_start_times[msg.channel][msg.note] != -1:  # note already started
@@ -108,7 +128,6 @@ def numpy_from_midi(midi):
                 note_start_times[msg.channel][msg.note] = curr_array_time()
 
             elif msg.type == 'note_off':
-                if msg.channel != 1: continue  # FIXME
                 if curr_array_time() >= TOTAL_OUTPUT_TIME_LENGTH:
                     continue
                 if note_start_times[msg.channel][msg.note] == -1:
@@ -122,7 +141,7 @@ def numpy_from_midi(midi):
 def shift_left_array(array):
     """
     >>> shift_left_array([5,4,9,2])
-    [0, 5, 4, 9 ]
+    [4,9,2,5]
     """
     res = np.roll(array, -1)
     res[-1] = 0
@@ -132,7 +151,7 @@ def shift_left_array(array):
 def shift_right_array(array):
     """
     >>> shift_right_array([5,4,9,2])
-    [0, 5, 4, 9]
+    [0,5,4,9]
     """
     res = np.roll(array, 1)
     res[0] = 0
@@ -147,13 +166,15 @@ def numpy_to_midi_track(chan_array, ticks_per_measure):
     :return: mido.MidiTrack full of messages
     """
     ticks_per_sample = ticks_per_measure / SAMPLES_PER_MEASURE
+
     chan_num = chan_array.channel_num
     array = chan_array.array
+    program = chan_array.program or 0
+
     shift_right = shift_right_array(array)
-    deriv = array - shift_right
-    note_starts = deriv > 0
     note_starts = (shift_right == 0) & (array != 0)
     note_stops = (shift_left_array(array) == 0) & (array != 0)
+    note_stops = shift_right_array(note_stops)  # FIXME
     array = array.T
 
     note_starts = note_starts.T
@@ -169,8 +190,11 @@ def numpy_to_midi_track(chan_array, ticks_per_measure):
         mido.Message('control_change', control=0,
                      channel=chan_num),
         mido.Message('program_change', channel=chan_num,
-                     program=chan_array.program)
+                     program=program)
     ])
+    if chan_array.messages:
+        track.extend(chan_array.messages)
+
     for vel_arr, is_starting_arr, is_stopping_arr in zip(array,
                                                          note_starts,
                                                          note_stops):
@@ -210,25 +234,31 @@ class ChannelArray:
     represents a midi track as a numpy array, with some extra info that does not fit in the track e.g. program number.
     """
 
-    def __init__(self, channel_num, program=None, name='', array=None):
+    def __init__(self, channel_num, program=None, name='',
+                 array=None, messages=None):
         self.program = program
         self.name = name
         self.channel_num = channel_num
         self.array = array or np.zeros((128, TOTAL_OUTPUT_TIME_LENGTH))
+        self.messages = messages
         # self.array[note][time] is velocity
 
     def _arr_info(self):
+        """info on array start and end indexes, used for debugging"""
         playing = (self.array > 0).T
-        # a[time][note] == (is note playing at that time)
-        start_ind = np.argmax(playing) // playing.shape[1]
-        stop_ind = (len(playing.flatten()) - np.argmax(playing[::-1])) // playing.shape[1]
+        if not np.any(playing):  # all is False
+            return 'empty'
+        start_ind = np.argmax(playing) // playing.shape[1]  # first True
+        stop_ind = (len(playing.flatten()) - np.argmax(playing[::-1])) // playing.shape[1]  # last True
         return ('starting %4d stopping %4d'
                 % (start_ind, stop_ind))
 
     def __repr__(self):
-        return 'channelArray %s#%d with prog %3d. %s' \
-               % (self.name + ' ' if self.name else '',
-                  self.channel_num, self.program, self._arr_info())
+        return 'channelArray {}#{} with prog {:3d}. {}' \
+            .format(self.name + ' ' if self.name else '',
+                    self.channel_num,
+                    self.program if self.program is not None else -1,
+                    self._arr_info())
 
 
 def map_to_4_channels(channels):
@@ -238,7 +268,9 @@ def map_to_4_channels(channels):
     :return: an list of 4 ChannelArrays
     """
     # create the four channels:
-    drums = ChannelArray(1, name='drums', program=118)  # TODO find a good drums program number
+    drums = ChannelArray(9, name='drums', program=0)  # channel_num has to be 9
+    # <meta message sequencer_specific data=(5, 15, 10, 1) time=0>
+
     piano = ChannelArray(2, name='piano', program=4)
     bass = ChannelArray(3, name='bass', program=32)
     guitar = ChannelArray(4, name='guitar', program=25)
@@ -267,23 +299,6 @@ def map_to_4_channels(channels):
     return drums, piano, bass, guitar
 
 
-tests = [
-    'tests/commend.mid',
-    'tests/dgate007.mid',
-    'tests/doom1e1.mid',
-    'tests/doom1e1_src_messages.txt',
-    'tests/ff3veldt.mid',
-    'tests/g3-intro.mid',
-    'tests/ky1_24.mid',
-    'tests/ky2-78.mid',
-    'tests/ky2-83.mid',
-    'tests/sick.mid',
-    'tests/strike36.mid',
-    'tests/strike41.mid',
-    'tests/zelda1.mid',
-]
-
-
 def write_msgs_to_file(filename, midi):
     """writes messages of a midi to a file in readable form, for debugging"""
     f = open(filename, 'w')
@@ -299,12 +314,16 @@ def there_and_back_again(filename):
     :param filename: an input file name of a midi file
     """
     print('testing on', filename)
-    src_midi = mido.MidiFile(filename)
+    try:
+        src_midi = mido.MidiFile(filename)
+    except EOFError:
+        print('error with midi file, exiting')
+        return
     ticks_per_measure = detect_time_signature(src_midi)
     print(src_midi)
     print(src_midi.ticks_per_beat)
     channels = numpy_from_midi(src_midi)
-    # channels = map_to_4_channels(channels.values())
+    channels = map_to_4_channels(channels)
     midi = mido.MidiFile(ticks_per_beat=src_midi.ticks_per_beat)
 
     infos = []
@@ -319,6 +338,19 @@ def there_and_back_again(filename):
     write_msgs_to_file(filename.split('.')[0] + '_src_messages.txt', src_midi)
 
 
-input_filename = tests[0]
-print('testing on file', input_filename)
+tests = [
+    'tests/CTOceanPalaceByCryogen.mid',
+    'tests/FireEmblem4_Crisis1.mid',
+    'tests/g3-intro.mid',
+    'tests/gmbalrog.mid',
+    'tests/MushiHS_Stage1.mid',
+    'tests/rcrstatus.mid',
+    'tests/sf2endch.mid',
+    'tests/sick.mid',
+    'tests/tmntovrw.mid',
+    'tests/turrican2_mstars.mid',
+    'tests/zelda1.mid',
+]
+
+input_filename = tests[2]
 there_and_back_again(input_filename)
