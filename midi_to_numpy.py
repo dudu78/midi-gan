@@ -76,7 +76,7 @@ def numpy_from_midi(midi):
     def create_channel(channel_num, program):
         channels[channel_num] = ChannelArray(msg.channel, program=program)
         note_start_times[channel_num] = np.full((128,), -1)
-        note_start_velocities[channel_num] = np.full((128,), 0.0)
+        note_start_velocities[channel_num] = np.zeros((128,), dtype=np.float32)
 
     for track in midi.tracks:
         # print('track:', track)
@@ -86,7 +86,7 @@ def numpy_from_midi(midi):
                 if msg.channel not in channels:  # create new channel
                     channels[msg.channel] = ChannelArray(msg.channel, program=None)
                     note_start_times[msg.channel] = np.full((128,), -1)
-                    note_start_velocities[msg.channel] = np.full((128,), 0.0)
+                    note_start_velocities[msg.channel] = np.zeros((128,), dtype=np.float32)
                 if msg.control == 0:  # bank change, start of a new track
                     absolute_time = 0
                     continue
@@ -120,8 +120,8 @@ def numpy_from_midi(midi):
                     continue
 
                 if note_start_times[msg.channel][msg.note] != -1:  # note already started
-                    print('unfinished note %d at time %d starts again, finishing'
-                          % (msg.note, curr_array_time()))
+                    # print('unfinished note %d at time %d starts again, finishing'
+                          # % (msg.note, curr_array_time()))
                     finish_note(msg.note, msg.velocity / (127 * 2), msg.channel)
 
                 note_start_velocities[msg.channel][msg.note] = msg.velocity / 127
@@ -131,8 +131,8 @@ def numpy_from_midi(midi):
                 if curr_array_time() >= TOTAL_OUTPUT_TIME_LENGTH:
                     continue
                 if note_start_times[msg.channel][msg.note] == -1:
-                    print('note %d at time %d to finish is already finished, finishing'
-                          % (msg.note, curr_array_time()))
+                    # print('note %d at time %d to finish is already finished, finishing'
+                          # % (msg.note, curr_array_time()))
                     continue
                 finish_note(msg.note, msg.velocity / 127, msg.channel)
     return chain(finished_channels, channels.values())
@@ -221,7 +221,8 @@ def numpy_to_midi_track(chan_array, ticks_per_measure):
                     delta_time -= int(delta_time)
                     did_note_start[note_num] = False
                 else:
-                    print("cannot end an unstarted note")
+                    # print("cannot end an unstarted note")
+                    pass
 
         delta_time += ticks_per_sample  # next sample
 
@@ -235,11 +236,11 @@ class ChannelArray:
     """
 
     def __init__(self, channel_num, program=None, name='',
-                 array=None, messages=None):
+                 messages=None):
         self.program = program
         self.name = name
         self.channel_num = channel_num
-        self.array = array or np.zeros((128, TOTAL_OUTPUT_TIME_LENGTH))
+        self.array = np.zeros((128, TOTAL_OUTPUT_TIME_LENGTH), dtype=np.float32)
         self.messages = messages
         # self.array[note][time] is velocity
 
@@ -261,42 +262,23 @@ class ChannelArray:
                     self._arr_info())
 
 
-def map_to_4_channels(channels):
+def map_to_one_channel(channels):
     """
-    maps multiple channels to only 4 channels, intended for reduction the number of channels for an AI to process
+    maps multiple channels to only one channels, intended for reduction the number of channels for an AI to process
     :param channels: an iterable of ChannelArrays
-    :return: an list of 4 ChannelArrays
+    :return: one ChannelArray
     """
-    # create the four channels:
-    drums = ChannelArray(9, name='drums', program=0)  # channel_num has to be 9
-    # <meta message sequencer_specific data=(5, 15, 10, 1) time=0>
 
     piano = ChannelArray(2, name='piano', program=4)
-    bass = ChannelArray(3, name='bass', program=32)
-    guitar = ChannelArray(4, name='guitar', program=25)
-    # map the given channels to our four
     for channel in channels:
-        print('mapping %d to ' % channel.program, end='')
-        if channel.program == 0 or channel.program >= 111:
-            drums.array += channel.array
-            print('drums')
-        elif (24 <= channel.program <= 30 or
-              40 <= channel.program <= 69 or
-              104 <= channel.program <= 110):
-            guitar.array += channel.array
-            print('guitar')
-        elif (31 <= channel.program <= 39 or
-              81 <= channel.program <= 96):
-            bass.array += channel.array
-            print('bass')
-        else:
+        channel.program = channel.program or 0
+        # print('mapping {} to '.format(channel.program), end='')
+        if not (channel.program == 0 or channel.program >= 111):  # channel aint drums
             piano.array += channel.array
-            print('piano')
     # some values may overflow above 1.0 resulting from the additions,
     # lets reset them back to 1.0
-    for out_chan in [drums, piano, bass, guitar]:
-        out_chan.array = np.minimum(out_chan.array, 1.0)
-    return drums, piano, bass, guitar
+    piano.array = np.minimum(piano.array, 1.0)
+    return piano
 
 
 def write_msgs_to_file(filename, midi):
@@ -323,34 +305,30 @@ def there_and_back_again(filename):
     print(src_midi)
     print(src_midi.ticks_per_beat)
     channels = numpy_from_midi(src_midi)
-    channels = map_to_4_channels(channels)
+    channel = map_to_one_channel(channels)
     midi = mido.MidiFile(ticks_per_beat=src_midi.ticks_per_beat)
 
-    infos = []
-    for chan_array in channels:
-        infos.append(str(chan_array))
-        back_track = numpy_to_midi_track(chan_array, ticks_per_measure)
-        midi.tracks.append(back_track)
-    infos.sort()
-    print('\n'.join(infos))
+    back_track = numpy_to_midi_track(channel, ticks_per_measure)
+    midi.tracks.append(back_track)
     midi.save('result.mid')
     write_msgs_to_file(filename.split('.')[0] + '_result_messages.txt', midi)
     write_msgs_to_file(filename.split('.')[0] + '_src_messages.txt', src_midi)
 
 
-tests = [
-    'tests/CTOceanPalaceByCryogen.mid',
-    'tests/FireEmblem4_Crisis1.mid',
-    'tests/g3-intro.mid',
-    'tests/gmbalrog.mid',
-    'tests/MushiHS_Stage1.mid',
-    'tests/rcrstatus.mid',
-    'tests/sf2endch.mid',
-    'tests/sick.mid',
-    'tests/tmntovrw.mid',
-    'tests/turrican2_mstars.mid',
-    'tests/zelda1.mid',
-]
+if __name__ == '__main__':
+    tests = [
+        'tests/CTOceanPalaceByCryogen.mid',
+        'tests/FireEmblem4_Crisis1.mid',
+        'tests/g3-intro.mid',
+        'tests/gmbalrog.mid',
+        'tests/MushiHS_Stage1.mid',
+        'tests/rcrstatus.mid',
+        'tests/sf2endch.mid',
+        'tests/sick.mid',
+        'tests/tmntovrw.mid',
+        'tests/turrican2_mstars.mid',
+        'tests/zelda1.mid',
+    ]
 
-input_filename = tests[2]
-there_and_back_again(input_filename)
+    input_filename = tests[2]
+    there_and_back_again(input_filename)
